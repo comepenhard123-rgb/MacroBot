@@ -35,6 +35,17 @@ AV_MAP = {
     "SPX":    ("ETF", "SPY", None),
 }
 
+AV_MAP_H4 = {
+    "EURUSD": ("FX_INTRADAY", "EUR", "USD"),
+    "GBPUSD": ("FX_INTRADAY", "GBP", "USD"),
+    "USDJPY": ("FX_INTRADAY", "USD", "JPY"),
+    "EURCHF": ("FX_INTRADAY", "EUR", "CHF"),
+    "GBPJPY": ("FX_INTRADAY", "GBP", "JPY"),
+    "AUDUSD": ("FX_INTRADAY", "AUD", "USD"),
+    "XAUUSD": ("ETF_INTRADAY", "GLD", None),
+    "SPX":    ("ETF_INTRADAY", "SPY", None),
+}
+
 # ─────────────────────────────────────────────
 # TELEGRAM HELPERS
 # ─────────────────────────────────────────────
@@ -65,8 +76,20 @@ def get_updates(offset: int = 0):
 # FETCH PRIX
 # ─────────────────────────────────────────────
 
-def fetch_candles(symbol: str):
-    """Retourne une liste de dicts {date, open, high, low, close} ou None."""
+def _parse_candles(ts: dict, n: int = 60) -> list:
+    """Parse un time series AlphaVantage en liste de candles."""
+    ok = lambda c: {
+        "open":  float(c.get("1. open",  c.get("open",  0))),
+        "high":  float(c.get("2. high",  c.get("high",  0))),
+        "low":   float(c.get("3. low",   c.get("low",   0))),
+        "close": float(c.get("4. close", c.get("close", 0))),
+    }
+    dates = sorted(ts.keys(), reverse=True)[:n]
+    return [{"date": d, **ok(ts[d])} for d in dates]
+
+
+def fetch_candles(symbol: str) -> list | None:
+    """Bougies Daily (contexte macro / structure long terme)."""
     if symbol not in AV_MAP:
         return None
     kind, a, b = AV_MAP[symbol]
@@ -74,25 +97,57 @@ def fetch_candles(symbol: str):
         if kind == "FX":
             url = (f"https://www.alphavantage.co/query?function=FX_DAILY"
                    f"&from_symbol={a}&to_symbol={b}&outputsize=compact&apikey={ALPHAVANTAGE_KEY}")
-            r = requests.get(url, timeout=15).json()
-            ts = r.get("Time Series FX (Daily)", {})
-            ok = lambda c: {"open": float(c["1. open"]), "high": float(c["2. high"]),
-                            "low":  float(c["3. low"]),  "close": float(c["4. close"])}
+            ts = requests.get(url, timeout=15).json().get("Time Series FX (Daily)", {})
         else:
             url = (f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY"
                    f"&symbol={a}&outputsize=compact&apikey={ALPHAVANTAGE_KEY}")
-            r = requests.get(url, timeout=15).json()
-            ts = r.get("Time Series (Daily)", {})
-            ok = lambda c: {"open": float(c["1. open"]), "high": float(c["2. high"]),
-                            "low":  float(c["3. low"]),  "close": float(c["4. close"])}
+            ts = requests.get(url, timeout=15).json().get("Time Series (Daily)", {})
+        return _parse_candles(ts, 30) if ts else None
+    except Exception as e:
+        print(f"[{symbol}] daily fetch error: {e}")
+        return None
+
+
+def fetch_candles_h4(symbol: str) -> list | None:
+    """
+    Bougies H4 via AlphaVantage FX_INTRADAY 60min (proxy H4 = 4 bougies 60min).
+    On regroupe 4 bougies 60min en une bougie H4.
+    """
+    if symbol not in AV_MAP_H4:
+        return None
+    kind, a, b = AV_MAP_H4[symbol]
+    try:
+        if kind == "FX_INTRADAY":
+            url = (f"https://www.alphavantage.co/query?function=FX_INTRADAY"
+                   f"&from_symbol={a}&to_symbol={b}&interval=60min"
+                   f"&outputsize=compact&apikey={ALPHAVANTAGE_KEY}")
+            ts = requests.get(url, timeout=15).json().get("Time Series FX (60min)", {})
+        else:
+            url = (f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY"
+                   f"&symbol={a}&interval=60min"
+                   f"&outputsize=compact&apikey={ALPHAVANTAGE_KEY}")
+            ts = requests.get(url, timeout=15).json().get("Time Series (60min)", {})
 
         if not ts:
             return None
-        dates = sorted(ts.keys(), reverse=True)[:30]
-        candles = [{"date": d, **ok(ts[d])} for d in dates]
-        return candles
+
+        raw = _parse_candles(ts, 96)  # 96 bougies 60min = 24 bougies H4
+
+        # Regrouper par blocs de 4 → H4
+        h4 = []
+        for i in range(0, len(raw) - 3, 4):
+            block = raw[i:i+4]
+            h4.append({
+                "date":  block[0]["date"],
+                "open":  block[3]["open"],
+                "high":  max(c["high"]  for c in block),
+                "low":   min(c["low"]   for c in block),
+                "close": block[0]["close"],
+            })
+        return h4 if h4 else None
+
     except Exception as e:
-        print(f"[{symbol}] fetch error: {e}")
+        print(f"[{symbol}] H4 fetch error: {e}")
         return None
 
 # ─────────────────────────────────────────────
@@ -350,39 +405,136 @@ def analyze_price_action(candles):
 # SL / TP AUTOMATIQUES
 # ─────────────────────────────────────────────
 
-def compute_sl_tp(pa: dict, symbol: str):
+def find_structure_levels(candles_h4: list, candles_daily: list, direction: str, current: float) -> dict:
     """
-    Calcule SL et TP basés sur les niveaux clés et l'ATR approx.
-    Retourne un dict avec sl, tp1, tp2, rr.
-    """
-    current = pa["current"]
-    h20     = pa.get("h20", current * 1.01)
-    l20     = pa.get("l20", current * 0.99)
-    direction = pa["direction"]
+    Identifie les vrais niveaux de structure pour SL et TP.
 
-    atr_approx = (h20 - l20) / 20  # ATR simplifié
+    SL : derrière le dernier swing low/high H4 significatif + buffer ATR
+    TP1 : prochain niveau de résistance/support H4 (1er obstacle)
+    TP2 : niveau daily suivant (objectif swing complet)
+
+    Aucun RR fixe — les prix viennent du marché.
+    """
+    h4 = candles_h4 or []
+    daily = candles_daily or []
+
+    highs_h4  = [c["high"]  for c in h4]
+    lows_h4   = [c["low"]   for c in h4]
+    highs_d   = [c["high"]  for c in daily]
+    lows_d    = [c["low"]   for c in daily]
+
+    # ATR H4 approximé sur 14 bougies
+    atr = 0
+    if len(h4) >= 14:
+        ranges = [c["high"] - c["low"] for c in h4[:14]]
+        atr = sum(ranges) / len(ranges)
+    else:
+        atr = current * 0.003  # fallback 0.3%
+
+    # ── Pivot highs H4 (résistances) ──
+    pivot_res = []
+    for i in range(2, min(len(highs_h4)-2, 20)):
+        if highs_h4[i] > highs_h4[i-1] and highs_h4[i] > highs_h4[i+1]            and highs_h4[i] > highs_h4[i-2] and highs_h4[i] > highs_h4[i+2]:
+            pivot_res.append(highs_h4[i])
+
+    # ── Pivot lows H4 (supports) ──
+    pivot_sup = []
+    for i in range(2, min(len(lows_h4)-2, 20)):
+        if lows_h4[i] < lows_h4[i-1] and lows_h4[i] < lows_h4[i+1]            and lows_h4[i] < lows_h4[i-2] and lows_h4[i] < lows_h4[i+2]:
+            pivot_sup.append(lows_h4[i])
+
+    # ── Niveaux daily (obstacles plus larges) ──
+    daily_res = sorted([h for h in highs_d[:20] if h > current], )[:3]
+    daily_sup = sorted([l for l in lows_d[:20]  if l < current], reverse=True)[:3]
 
     if direction == "BUY":
-        sl  = round(l20 - atr_approx * 0.3, 5)
-        tp1 = round(current + (current - sl) * 1.5, 5)
-        tp2 = round(current + (current - sl) * 2.5, 5)
+        # SL : dernier swing low H4 sous le prix - buffer ATR
+        sup_below = sorted([s for s in pivot_sup if s < current], reverse=True)
+        sl_base   = sup_below[0] if sup_below else (current - atr * 2)
+        sl        = round(sl_base - atr * 0.5, 5)
+
+        # TP1 : 1ère résistance H4 au-dessus du prix
+        res_above_h4 = sorted([r for r in pivot_res if r > current + atr * 0.5])
+        tp1 = round(res_above_h4[0], 5) if res_above_h4 else round(current + atr * 3, 5)
+
+        # TP2 : résistance daily suivante (objectif swing)
+        res_above_d = sorted([r for r in daily_res if r > tp1 + atr * 0.3])
+        tp2 = round(res_above_d[0], 5) if res_above_d else round(current + atr * 6, 5)
+
         risk = current - sl
+
     elif direction == "SELL":
-        sl  = round(h20 + atr_approx * 0.3, 5)
-        tp1 = round(current - (sl - current) * 1.5, 5)
-        tp2 = round(current - (sl - current) * 2.5, 5)
+        # SL : dernier swing high H4 au-dessus + buffer ATR
+        res_above = sorted([r for r in pivot_res if r > current])
+        sl_base   = res_above[0] if res_above else (current + atr * 2)
+        sl        = round(sl_base + atr * 0.5, 5)
+
+        # TP1 : 1er support H4 sous le prix
+        sup_below_h4 = sorted([s for s in pivot_sup if s < current - atr * 0.5], reverse=True)
+        tp1 = round(sup_below_h4[0], 5) if sup_below_h4 else round(current - atr * 3, 5)
+
+        # TP2 : support daily suivant
+        sup_below_d = sorted([s for s in daily_sup if s < tp1 - atr * 0.3], reverse=True)
+        tp2 = round(sup_below_d[0], 5) if sup_below_d else round(current - atr * 6, 5)
+
         risk = sl - current
+
     else:
         return None
 
-    rr = (tp1 - current) / risk if direction == "BUY" else (current - tp1) / risk
-    return {"sl": sl, "tp1": tp1, "tp2": tp2, "rr": round(abs(rr), 2), "risk_pips": round(abs(risk * 10000), 1)}
+    if risk <= 0:
+        risk = atr
+
+    rr1 = abs(tp1 - current) / risk
+    rr2 = abs(tp2 - current) / risk
+
+    return {
+        "sl":        sl,
+        "tp1":       tp1,
+        "tp2":       tp2,
+        "rr1":       round(rr1, 2),
+        "rr2":       round(rr2, 2),
+        "risk_pips": round(abs(risk * 10000), 1),
+        "atr_pips":  round(atr * 10000, 1),
+    }
+
+
+def compute_sl_tp(pa: dict, symbol: str, candles_h4: list = None, candles_daily: list = None):
+    """Wrapper — utilise find_structure_levels si données H4 dispo."""
+    if candles_h4 and candles_daily:
+        return find_structure_levels(candles_h4, candles_daily, pa["direction"], pa["current"])
+    # Fallback si pas de données H4
+    current   = pa["current"]
+    h20       = pa.get("h20", current * 1.01)
+    l20       = pa.get("l20", current * 0.99)
+    atr       = (h20 - l20) / 20
+    direction = pa["direction"]
+    if direction == "BUY":
+        sl   = round(l20 - atr * 0.3, 5)
+        tp1  = round(h20, 5)
+        tp2  = round(h20 + (h20 - l20) * 0.5, 5)
+        risk = current - sl
+    elif direction == "SELL":
+        sl   = round(h20 + atr * 0.3, 5)
+        tp1  = round(l20, 5)
+        tp2  = round(l20 - (h20 - l20) * 0.5, 5)
+        risk = sl - current
+    else:
+        return None
+    if risk <= 0: risk = atr
+    return {
+        "sl": sl, "tp1": tp1, "tp2": tp2,
+        "rr1": round(abs(tp1 - current) / risk, 2),
+        "rr2": round(abs(tp2 - current) / risk, 2),
+        "risk_pips": round(abs(risk * 10000), 1),
+        "atr_pips":  round(atr * 10000, 1),
+    }
 
 # ─────────────────────────────────────────────
 # RAPPORT COMPLET
 # ─────────────────────────────────────────────
 
-def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: dict, is_weekend: bool = False) -> str:
+def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: dict, is_weekend: bool = False, candles_h4: list = None, candles_daily: list = None) -> str:
     total = min(100, macro_score + pa["score"])
 
     if total >= 80:   quality = "🔥 EXCELLENT"
@@ -392,7 +544,7 @@ def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: di
 
     dir_label = {"BUY": "🟢 ACHAT", "SELL": "🔴 VENTE", "NEUTRE": "⚪ NEUTRE"}.get(pa["direction"], "⚪")
 
-    sltp = compute_sl_tp(pa, symbol)
+    sltp = compute_sl_tp(pa, symbol, candles_h4, candles_daily)
 
     now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
@@ -413,12 +565,13 @@ def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: di
     if sltp and pa["direction"] != "NEUTRE":
         lines += [
             f"",
-            f"━━━ 🎯 SL / TP ━━━",
-            f"🛑 *Stop Loss :* `{sltp['sl']}`",
-            f"🎯 *TP1 (1.5R) :* `{sltp['tp1']}`",
-            f"🎯 *TP2 (2.5R) :* `{sltp['tp2']}`",
-            f"📐 *R/R :* `{sltp['rr']}:1`",
-            f"⚠️ *Risque :* `{sltp['risk_pips']} pips`",
+            f"━━━ 🎯 Niveaux (structure H4) ━━━",
+            f"🛑 *Stop Loss :* `{sltp['sl']}` ({sltp['risk_pips']} pips)",
+            f"🎯 *TP1 (résistance H4) :* `{sltp['tp1']}` → R/R `{sltp['rr1']}:1`",
+            f"🎯 *TP2 (niveau Daily) :*  `{sltp['tp2']}` → R/R `{sltp['rr2']}:1`",
+            f"📏 *ATR H4 :* `{sltp['atr_pips']} pips`",
+            f"",
+            f"_SL et TP posés sur niveaux de structure réels_",
         ]
 
     lines += [
@@ -467,8 +620,13 @@ def run_scan(chat_id=None, single_symbol=None):
             time.sleep(12)  # respecter limite AlphaVantage
             continue
 
+        print(f"  Fetch H4 {symbol}...")
+        candles_h4 = fetch_candles_h4(symbol)
+        time.sleep(12)
+
         pa = analyze_price_action(candles)
-        report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend)
+        report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend,
+                                   candles_h4=candles_h4, candles_daily=candles)
         total = min(100, macro_score + pa["score"])
 
         # En mode /signal on envoie toujours le rapport
@@ -569,11 +727,14 @@ def auto_scheduler():
             if not candles:
                 time.sleep(12)
                 continue
+            candles_h4 = fetch_candles_h4(symbol)
+            time.sleep(12)
             pa = analyze_price_action(candles)
             total = min(100, macro_score + pa["score"])
             print(f"  {symbol}: {total}/100")
             if total >= SCORE_THRESHOLD and pa["direction"] != "NEUTRE":
-                report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend)
+                report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend,
+                                           candles_h4=candles_h4, candles_daily=candles)
                 send_telegram(f"ALERTE MacroFlow - Score {total}/100\n\n" + report)
             time.sleep(12)
         time.sleep(interval_sec)
