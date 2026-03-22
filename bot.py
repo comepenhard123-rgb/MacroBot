@@ -19,8 +19,8 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALPHAVANTAGE_KEY  = os.environ.get("ALPHAVANTAGE_KEY", "demo")
 NEWSAPI_KEY       = os.environ.get("NEWSAPI_KEY", "")
 
-SCORE_THRESHOLD   = 55          # Score minimum pour envoyer une alerte auto
-SCAN_INTERVAL_H   = 3           # Scan toutes les X heures
+SCORE_THRESHOLD   = 80          # Score minimum pour envoyer une alerte auto
+SCAN_INTERVAL_H   = 1           # Scan toutes les X heures (vérification en continu)
 
 ASSETS = ["EURUSD", "GBPUSD", "USDJPY", "EURCHF", "GBPJPY", "AUDUSD", "XAUUSD", "SPX"]
 
@@ -496,13 +496,27 @@ def handle_commands():
 # ─────────────────────────────────────────────
 
 def auto_scheduler():
-    """Lance un scan automatique toutes les SCAN_INTERVAL_H heures."""
+    """
+    Scan toutes les heures en silencieux.
+    Envoie une alerte UNIQUEMENT si score >= 80. Pas de message si rien trouve.
+    """
     interval_sec = SCAN_INTERVAL_H * 3600
-    # Premier scan après 60 secondes (laisser le bot se connecter)
     time.sleep(60)
     while True:
-        print(f"⏰ Scan automatique...")
-        run_scan()
+        print("Scan silencieux...")
+        macro_score, macro_signals = analyze_macro()
+        for symbol in ASSETS:
+            candles = fetch_candles(symbol)
+            if not candles:
+                time.sleep(12)
+                continue
+            pa = analyze_price_action(candles)
+            total = min(100, macro_score + pa["score"])
+            print(f"  {symbol}: {total}/100")
+            if total >= SCORE_THRESHOLD and pa["direction"] != "NEUTRE":
+                report = build_full_report(symbol, macro_score, macro_signals, pa)
+                send_telegram(f"ALERTE MacroFlow - Score {total}/100\n\n" + report)
+            time.sleep(12)
         time.sleep(interval_sec)
 
 # ─────────────────────────────────────────────
