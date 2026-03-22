@@ -129,17 +129,76 @@ def analyze_macro():
 
     now = datetime.now(timezone.utc)
     dow, h = now.weekday(), now.hour
+    is_weekend = dow in (5, 6)
     if dow == 4 and 12 <= h <= 16:
         signals.append("⚡ Vendredi US session — possible NFP/données importantes")
         score += 20
     elif dow == 2:
         signals.append("📅 Mercredi — possible FOMC/inventaires")
         score += 10
-    elif dow in (5, 6):
-        signals.append("😴 Weekend — liquidité faible, éviter les nouvelles positions FX")
-        score -= 10
 
-    return max(0, score), signals
+    return max(0, score), signals, is_weekend
+
+# ─────────────────────────────────────────────
+# CONTEXTE MACRO PAR ASSET
+# ─────────────────────────────────────────────
+
+ASSET_CONTEXT = {
+    "EURUSD": {"type": "fx",  "usd": "quote", "desc": "EUR vs USD — sensible Fed/BCE"},
+    "GBPUSD": {"type": "fx",  "usd": "quote", "desc": "GBP vs USD — sensible BoE/Fed"},
+    "USDJPY": {"type": "fx",  "usd": "base",  "desc": "USD vs JPY — risk-on/off + BoJ"},
+    "EURCHF": {"type": "fx",  "usd": None,    "desc": "EUR vs CHF — flux refuge + SNB"},
+    "GBPJPY": {"type": "fx",  "usd": None,    "desc": "GBP vs JPY — paire volatile risk-on"},
+    "AUDUSD": {"type": "fx",  "usd": "quote", "desc": "AUD vs USD — corrélé commodités/Chine"},
+    "XAUUSD": {"type": "gold","usd": "quote", "desc": "Or — refuge + inverse USD"},
+    "SPX":    {"type": "idx", "usd": None,    "desc": "S&P500 — risk-on, sensible Fed"},
+}
+
+def get_asset_macro_context(symbol: str, macro_signals: list, is_weekend: bool) -> list:
+    """Génère des signaux macro spécifiques à l'asset."""
+    ctx = ASSET_CONTEXT.get(symbol, {})
+    extra = []
+
+    # Warning weekend uniquement pour FX
+    if is_weekend and ctx.get("type") == "fx":
+        extra.append("😴 Weekend — spread élargi, liquidité réduite sur FX")
+
+    # Contexte USD selon sentiment macro
+    sentiment = ""
+    for s in macro_signals:
+        if "HAWKISH" in s: sentiment = "hawkish"
+        if "DOVISH"  in s: sentiment = "dovish"
+
+    usd_role = ctx.get("usd")
+    if sentiment == "hawkish":
+        if usd_role == "quote":
+            extra.append(f"💡 Sentiment hawkish → USD fort → pression haussière sur {symbol}")
+        elif usd_role == "base":
+            extra.append(f"💡 Sentiment hawkish → USD fort → favorable à {symbol}")
+    elif sentiment == "dovish":
+        if usd_role == "quote":
+            extra.append(f"💡 Sentiment dovish → USD faible → favorable à {symbol}")
+        elif usd_role == "base":
+            extra.append(f"💡 Sentiment dovish → USD faible → pression baissière sur {symbol}")
+
+    # Contexte spécifique or
+    if ctx.get("type") == "gold":
+        if sentiment == "dovish":
+            extra.append("🥇 Or : corrélation négative USD + sentiment dovish = favorable")
+        elif sentiment == "hawkish":
+            extra.append("🥇 Or : USD fort = pression baissière sur l'or à surveiller")
+
+    # Contexte indices
+    if ctx.get("type") == "idx":
+        if sentiment == "dovish":
+            extra.append("📊 Indices : dovish = potentiel risk-on → favorable aux indices")
+        elif sentiment == "hawkish":
+            extra.append("📊 Indices : hawkish = taux hauts = pression sur les valorisations")
+
+    if extra:
+        return extra
+    return [f"ℹ️ Pas de signal macro directionnel spécifique pour {symbol}"]
+
 
 # ─────────────────────────────────────────────
 # TRENDLINES
@@ -323,7 +382,7 @@ def compute_sl_tp(pa: dict, symbol: str):
 # RAPPORT COMPLET
 # ─────────────────────────────────────────────
 
-def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: dict) -> str:
+def build_full_report(symbol: str, macro_score: int, macro_signals: list, pa: dict, is_weekend: bool = False) -> str:
     total = min(100, macro_score + pa["score"])
 
     if total >= 80:   quality = "🔥 EXCELLENT"
@@ -397,7 +456,7 @@ def run_scan(chat_id=None, single_symbol=None):
 
     send_telegram(f"🔍 *Scan démarré* — {len(targets)} asset(s)...", cid)
 
-    macro_score, macro_signals = analyze_macro()
+    macro_score, macro_signals, is_weekend = analyze_macro()
     alerts = []
 
     for symbol in targets:
@@ -409,7 +468,7 @@ def run_scan(chat_id=None, single_symbol=None):
             continue
 
         pa = analyze_price_action(candles)
-        report = build_full_report(symbol, macro_score, macro_signals, pa)
+        report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend)
         total = min(100, macro_score + pa["score"])
 
         # En mode /signal on envoie toujours le rapport
@@ -504,7 +563,7 @@ def auto_scheduler():
     time.sleep(60)
     while True:
         print("Scan silencieux...")
-        macro_score, macro_signals = analyze_macro()
+        macro_score, macro_signals, is_weekend = analyze_macro()
         for symbol in ASSETS:
             candles = fetch_candles(symbol)
             if not candles:
@@ -514,7 +573,7 @@ def auto_scheduler():
             total = min(100, macro_score + pa["score"])
             print(f"  {symbol}: {total}/100")
             if total >= SCORE_THRESHOLD and pa["direction"] != "NEUTRE":
-                report = build_full_report(symbol, macro_score, macro_signals, pa)
+                report = build_full_report(symbol, macro_score, macro_signals, pa, is_weekend)
                 send_telegram(f"ALERTE MacroFlow - Score {total}/100\n\n" + report)
             time.sleep(12)
         time.sleep(interval_sec)
